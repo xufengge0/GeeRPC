@@ -1,6 +1,8 @@
 package geerpc
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,7 +10,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
+	"time"
 )
 
 // Call 承载一次 RPC 调用的信息
@@ -21,6 +25,7 @@ type Call struct {
 	Done          chan *Call // 调用结束时，通知调用方
 }
 
+// 将 Call 实例放入 Done 通道，通知调用结束
 func (call *Call) done() {
 	call.Done <- call
 }
@@ -59,6 +64,7 @@ func (client *Client) IsAvailable() bool {
 	return !client.shutdown && !client.closing
 }
 
+// 注册调用，返回编号
 func (client *Client) registerCall(call *Call) (uint64, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -148,6 +154,48 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	go client.receive()
 	return client
 }
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+// 支持超时的 Dial 函数
+func DialTimeout(network, address string,  opts ...*Option) (*Client, error) {
+	return dialWithTimeout(NewClient, network, address, opts...)
+}
+func dialWithTimeout(f newClientFunc, network, address string, opts ...*Option) (*Client, error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectionTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if conn == nil {
+			_ = conn.Close()
+		}
+	}()
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client, err}
+	}()
+	if opt.ConnectionTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectionTimeout):
+		return nil, errors.New("rpc client: connect timeout")
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
 func parseOptions(opts ...*Option) (*Option, error) {
 	// if opts is nil or pass nil as parameter
 	if len(opts) == 0 || opts[0] == nil {
@@ -180,12 +228,11 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 	}()
 	return NewClient(conn, opt)
 }
+
 func (client *Client) send(call *Call) {
-	// make sure that the client will send a complete request
 	client.sending.Lock()
 	defer client.sending.Unlock()
 
-	// register this call.
 	seq, err := client.registerCall(call)
 	if err != nil {
 		call.Error = err
@@ -193,12 +240,12 @@ func (client *Client) send(call *Call) {
 		return
 	}
 
-	// prepare request header
+	// 准备请求头
 	client.header.ServiceMethod = call.ServiceMethod
 	client.header.Seq = seq
 	client.header.Error = ""
 
-	// encode and send the request
+	// 编码并发送请求
 	if err = client.cc.Write(&client.header, call.Args); err != nil {
 		call := client.removeCall(seq)
 		// call may be nil, it usually means that Write partially failed,
@@ -224,7 +271,31 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 	client.send(call)
 	return call
 }
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case <-call.Done:
+		return call.Error
+	}
+}
+
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	// Require successful HTTP response
+	// before switching to RPC protocol.
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialWithTimeout(NewHTTPClient, network, address, opts...)
 }

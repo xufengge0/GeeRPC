@@ -8,22 +8,27 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c // gee的RPC请求
 
 // 协议协商
 type Option struct {
-	MagicNumber int        // 请求类型
-	CodecType   codec.Type // header、body的编码方式
+	MagicNumber       int        // 请求类型
+	CodecType         codec.Type // header、body的编码方式
+	ConnectionTimeout time.Duration
+	HandleTimeout     time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:       MagicNumber,
+	CodecType:         codec.GobType,
+	ConnectionTimeout: time.Second * 10,
 }
 
 type Server struct {
@@ -69,6 +74,7 @@ func (server *Server) findService(serviceMethod string) (svc *service, mtype *me
 	}
 	return
 }
+
 func (s *Server) Accept(lis net.Listener) {
 	for {
 		conn, err := lis.Accept()
@@ -181,6 +187,7 @@ func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 // 处理请求
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
+	// 调用实际的 service.method
 	err := req.svc.call(req.mtype, req.argv, req.replyv)
 	if err != nil {
 		req.h.Error = err.Error()
@@ -197,4 +204,34 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	if err := cc.Write(h, body); err != nil {
 		log.Println("rpc server: write response error:", err)
 	}
+}
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geeprc_"
+	defaultDebugPath = "/debug/geerpc"
+)
+// 实现 http.Handler 接口
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodConnect {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must POST\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Println("rpc hijacking", req.RemoteAddr, ":", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	s.ServerConn(conn)
+}
+func (server *Server) HandleHTTP() {
+	// 注册默认RPC服务
+	http.Handle(defaultRPCPath, server)
+}
+// DefaultServer注册HTTP服务
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }
