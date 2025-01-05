@@ -1,3 +1,6 @@
+/* 
+手动实现注册中心服务发现
+*/
 package xclient
 
 import (
@@ -49,6 +52,7 @@ func (d *MultiServerDiscovery) Update(servers []string) error {
 	d.servers = servers
 	return nil
 }
+// 根据负载均衡策略，返回给客户端一个健康的服务器节点
 func (d *MultiServerDiscovery) Get(mode SelectMode) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -66,6 +70,7 @@ func (d *MultiServerDiscovery) Get(mode SelectMode) (string, error) {
 	}
 	return "", errors.New("rpc discovery: not supported select mode")
 }
+// 返回客户端所有的服务器节点
 func (d *MultiServerDiscovery) GetAll() ([]string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

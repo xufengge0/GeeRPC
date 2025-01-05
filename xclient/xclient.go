@@ -1,3 +1,6 @@
+/* 
+支持负载均衡的客户端
+*/
 package xclient
 
 import (
